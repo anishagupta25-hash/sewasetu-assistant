@@ -1,0 +1,210 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Sewa Setu MCP Evaluation Dashboard</title>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            background: #f5f7fb;
+            color: #222;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 30px auto;
+            padding: 0 20px;
+        }
+
+        h1 {
+            color: #173b6c;
+            margin-bottom: 5px;
+        }
+
+        .subtitle {
+            color: #666;
+            margin-bottom: 25px;
+        }
+
+        .cards {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 25px;
+        }
+
+        .card {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            flex: 1;
+            box-shadow: 0 2px 8px rgba(0,0,0,.08);
+        }
+
+        .number {
+            font-size: 32px;
+            font-weight: bold;
+            color: #173b6c;
+        }
+
+        .label {
+            color: #666;
+            margin-top: 5px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+            box-shadow: 0 2px 8px rgba(0,0,0,.08);
+        }
+
+        th, td {
+            padding: 12px;
+            border-bottom: 1px solid #ddd;
+            text-align: left;
+            vertical-align: top;
+        }
+
+        th {
+            background: #173b6c;
+            color: white;
+        }
+
+        .pass {
+            color: #18733b;
+            font-weight: bold;
+        }
+
+        .fail {
+            color: #b42318;
+            font-weight: bold;
+        }
+
+        .section {
+            margin-top: 35px;
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 8px rgba(0,0,0,.08);
+        }
+
+        code {
+            background: #eee;
+            padding: 3px 6px;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="container">
+
+    <h1>Sewa Setu MCP Evaluation Dashboard</h1>
+
+    <div class="subtitle">
+        Citizen and Block Officer MCP evaluation results
+    </div>
+
+    <div class="cards">
+
+        <div class="card">
+            <div class="number">{{ total }}</div>
+            <div class="label">Total Tests</div>
+        </div>
+
+        <div class="card">
+            <div class="number">{{ passed }}</div>
+            <div class="label">Passed</div>
+        </div>
+
+        <div class="card">
+            <div class="number">{{ percentage }}%</div>
+            <div class="label">Pass Rate</div>
+        </div>
+
+    </div>
+
+    <div class="section">
+
+        <h2>Evaluation Cases</h2>
+
+        <table>
+
+            <tr>
+                <th>ID</th>
+                <th>Persona</th>
+                <th>Goal</th>
+                <th>Channel</th>
+                <th>Expected</th>
+                <th>Actual</th>
+                <th>Result</th>
+            </tr>
+
+            {% for r in results %}
+
+            <tr>
+                <td><code>{{ r.id }}</code></td>
+
+                <td>
+                    <strong>{{ r.persona }}</strong><br>
+                    Age: {{ r.age }}<br>
+                    Village: {{ r.village }}
+                </td>
+
+                <td>{{ r.goal }}</td>
+
+                <td>{{ r.channel }}</td>
+
+                <td>{{ r.expected }}</td>
+
+                <td>{{ r.actual }}</td>
+
+                <td>
+                    {% if r.status == "PASS" %}
+                        <span class="pass">PASS</span>
+                    {% else %}
+                        <span class="fail">FAIL</span>
+                    {% endif %}
+                </td>
+
+            </tr>
+
+            {% endfor %}
+
+        </table>
+
+    </div>
+
+    <div class="section">
+
+        <h2>Architecture</h2>
+
+        <p>
+            Citizen assistant:
+            <code>/mcp</code> on port <code>8100</code>
+        </p>
+
+        <p>
+            Officer assistant:
+            <code>/mcp</code> on port <code>8200</code>
+        </p>
+
+        <p>
+            Portal remains the system of record. Applications and audit
+            history are stored in PostgreSQL.
+        </p>
+
+        <p>
+            Citizen and officer tools are intentionally exposed through
+            separate MCP servers.
+        </p>
+
+    </div>
+
+</div>
+
+</body>
+</html>
