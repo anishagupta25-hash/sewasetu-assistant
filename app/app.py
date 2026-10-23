@@ -34,7 +34,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 config = configparser.ConfigParser()
 config.read(os.path.join(BASE_DIR, "config", "app.ini"))
 
-app = Flask(__name__, template_folder="templates")
+app = Flask(__name__, template_folder=os.path.join(BASE_DIR, "templates"))
 app.secret_key = os.environ.get("SECRET_KEY") or config.get("app", "secret_key")
 # Two hours: elderly applicants fill the form slowly; the draft lives in the session.
 app.config["PERMANENT_SESSION_LIFETIME"] = 7200
