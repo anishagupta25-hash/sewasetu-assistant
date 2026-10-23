@@ -39,7 +39,24 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from flask import (Blueprint, request, jsonify, redirect, render_template, session,
                    flash, url_for, abort)
 
-import app as portal
+class _PortalProxy:
+    def __getattr__(self, name):
+        import app as portal
+        return getattr(portal, name)
+
+
+portal = _PortalProxy()
+
+from flask import (Blueprint, request, jsonify, redirect, render_template, session,
+                   flash, url_for, abort)
+
+class _PortalProxy:
+    def __getattr__(self, name):
+        import app as portal
+        return getattr(portal, name)
+
+
+portal = _PortalProxy()
 
 oauth = Blueprint("oauth", __name__)
 
