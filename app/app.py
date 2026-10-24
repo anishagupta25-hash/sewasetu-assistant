@@ -72,6 +72,7 @@ def get_db():
     database_url = os.environ.get("DATABASE_URL")
 
     if database_url:
+        database_url = database_url.replace("postgres://", "postgresql://", 1)
         return psycopg2.connect(database_url)
 
     return psycopg2.connect(
@@ -81,8 +82,6 @@ def get_db():
         user=config.get("database", "user"),
         password=config.get("database", "password"),
     )
-
-
 
 def sanitize(value, maxlen=100):
     # Trim whitespace and cap at the column width, counting characters (not
