@@ -6,9 +6,9 @@ Developed by: Netlink Infosolutions Pvt Ltd (2023)
 Maintained in-house since 02/2026.
 """
 
-from email.mime import text
 import os
 import io
+import json
 import re
 import random
 import hashlib
@@ -25,6 +25,7 @@ def now_ist():
 
 import requests
 import psycopg2
+from psycopg2 import errors as pg_errors
 from flask import (Flask, request, session, redirect, url_for, render_template,
                    flash, send_file, abort)
 from fpdf import FPDF
@@ -47,6 +48,7 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 ACTIVE_STATUSES = ("PENDING", "APPROVED", "DEEMED_APPROVED")
 
 SMS_GATEWAY_URL = os.environ.get("SMS_GATEWAY_URL") or config.get("app", "sms_gateway_url")
+app.logger.info("ACTIVE SMS GATEWAY URL: %s", SMS_GATEWAY_URL)
 OTP_VALIDITY_SECONDS = config.getint("app", "otp_validity_seconds")
 UPLOAD_DIR = config.get("app", "upload_dir")
 SCHEME_DEADLINE = datetime.strptime(config.get("pension", "scheme_deadline"),
@@ -55,6 +57,15 @@ MIN_AGE = config.getint("pension", "min_age")
 SLA_DAYS = config.getint("pension", "sla_days")
 
 BLOCKS = ["Sonari", "Rajapara", "Dhemaji Pathar", "Borgaon", "Namti", "Khelua"]
+
+# Widths of the database columns (schema.sql). Longer values make PostgreSQL refuse the
+# row, so they are checked up front and reported in plain language.
+MAX_NOTE = 500            # audit_log.note
+MAX_DOC_PATH = 200        # applications.doc_path
+FIELD_LIMITS = (("village", "village", 100), ("husband name", "husband_name", 100),
+                ("gender", "gender", 10), ("marital status", "marital_status", 20))
+# Name of the unique index that allows one live application per mobile (migrations/001).
+ACTIVE_INDEX = "uq_app_one_active_per_mobile"
 
 import logging
 _logdir = "/var/log/sewasetu"
@@ -89,6 +100,16 @@ def sanitize(value, maxlen=100):
     if value is None:
         return ""
     return value.strip()[:maxlen]
+
+
+def safe_upload_name(filename, maxlen=60):
+    """Lower-case file name with only letters, digits, dot, dash and underscore, no folder
+    parts, at most `maxlen` characters, extension kept."""
+    name = re.sub(r"[^a-z0-9._-]", "_", os.path.basename(filename or "").lower())
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        return name[:maxlen]
+    return stem[:max(1, maxlen - len(ext) - 1)] + "." + ext
 
 
 def hash_password(p):
@@ -127,14 +148,27 @@ def deadline_remaining():
     return int(delta.total_seconds() // 3600)
 
 
-def new_application_no():
-    return "SSP" + datetime.now().strftime("%y") + str(random.randint(100000, 999999))
+def new_application_no(cur=None):
+    """SSP + 2-digit year + 6 random digits.
+
+    With a cursor, the number is checked against the table and redrawn until unused
+    (about 100k applications already exist, so a plain random draw can collide).
+    """
+    year = now_ist().strftime("%y")
+    for _ in range(20):
+        number = "SSP" + year + str(random.randint(100000, 999999))
+        if cur is None:
+            return number
+        cur.execute("SELECT 1 FROM applications WHERE application_no = %s", (number,))
+        if cur.fetchone() is None:
+            return number
+    raise RuntimeError("could not allocate a unique application number")
 
 
 def write_audit(cur, app_id, action, actor, note=""):
     cur.execute("INSERT INTO audit_log (application_id, action, actor, note, at) "
                 "VALUES (%s, %s, %s, %s, %s)",
-                (app_id, action, actor, note, datetime.now()))
+                (app_id, action, (actor or "")[:50], (note or "")[:MAX_NOTE], now_ist()))
 
 
 # ---------------------------------------------------------------------------
@@ -176,9 +210,15 @@ def validate_application(data, doc_path):
         "dob": None,
     }
     for label, key in (("full name", "applicant_name"), ("village", "village"),
-                       ("block", "block"), ("bank account", "bank_account")):
+                       ("block", "block"), ("bank account", "bank_account"),
+                       ("IFSC code", "ifsc")):
         if not cleaned[key]:
             errors.append("%s is required" % label)
+    for label, key, limit in FIELD_LIMITS:
+        if len(cleaned[key]) > limit:
+            errors.append("%s must be at most %d characters" % (label, limit))
+    if len(cleaned["doc_path"]) > MAX_DOC_PATH:
+        errors.append("age proof file name is too long")
     if cleaned["block"] and cleaned["block"] not in BLOCKS:
         errors.append("block must be one of: " + ", ".join(BLOCKS))
     if cleaned["bank_account"] and not re.fullmatch(r"\d{9,18}", cleaned["bank_account"]):
@@ -212,7 +252,7 @@ def create_application(cur, mobile, cleaned):
 
     The caller commits. Returns (id, application_no).
     """
-    app_no = new_application_no()
+    app_no = new_application_no(cur)
     cur.execute(
         """INSERT INTO applications
            (application_no, applicant_name, mobile, dob, gender, marital_status,
@@ -223,7 +263,7 @@ def create_application(cur, mobile, cleaned):
         (app_no, cleaned["applicant_name"], mobile, cleaned["dob"], cleaned["gender"],
          cleaned["marital_status"], cleaned["husband_name"], cleaned["husband_employer"],
          cleaned["village"], cleaned["block"], cleaned["bank_account"], cleaned["ifsc"],
-         cleaned["doc_path"], datetime.now()))
+         cleaned["doc_path"], now_ist()))
     new_id = cur.fetchone()[0]
 
     # status portal account; password is DOB as DDMMYYYY per dept. circular
@@ -235,9 +275,39 @@ def create_application(cur, mobile, cleaned):
     write_audit(cur, new_id, "SUBMIT", "applicant:%s" % mobile)
     return new_id, app_no
 
+
+def withdraw_pending(cur, app_id, mobile):
+    """Withdraw the applicant's own PENDING application. Returns its application_no,
+    or None when nothing was withdrawn. The caller commits. Used by the web portal
+    and by the citizen assistant so both apply the same rule and audit trail."""
+    cur.execute("UPDATE applications SET status = 'WITHDRAWN', decided_at = %s, "
+                "decided_by = 'APPLICANT' WHERE id = %s AND mobile = %s "
+                "AND status = 'PENDING' RETURNING application_no",
+                (now_ist(), app_id, mobile))
+    row = cur.fetchone()
+    if not row:
+        return None
+    write_audit(cur, app_id, "WITHDRAW", "applicant:%s" % mobile)
+    return row[0]
+
+
+def decide_pending(cur, app_id, new_status, actor, note="", audit_actor=None):
+    """Approve or reject a PENDING application. Returns its application_no, or None
+    when it was not pending. The caller commits. Shared by the admin pages and the
+    officer assistant."""
+    cur.execute("UPDATE applications SET status = %s, decided_at = %s, decided_by = %s "
+                "WHERE id = %s AND status = 'PENDING' RETURNING application_no",
+                (new_status, now_ist(), actor, app_id))
+    row = cur.fetchone()
+    if not row:
+        return None
+    write_audit(cur, app_id, new_status, audit_actor or "admin:%s" % actor, note)
+    return row[0]
+
 @app.route("/")
 def index():
-    return render_template("index.html", hours_left=deadline_remaining())
+    return render_template("index.html", hours_left=deadline_remaining(),
+                           deadline_text=SCHEME_DEADLINE.strftime("%d %B %Y, %I:%M %p"))
 
 
 @app.route("/about")
@@ -282,7 +352,7 @@ def apply():
         conn = get_db()
         cur = conn.cursor()
         cur.execute("INSERT INTO otps (mobile, code, created_at) VALUES (%s, %s, %s)",
-                    (mobile, code, datetime.now()))
+                    (mobile, code, now_ist()))
         conn.commit()
         cur.close(); conn.close()
         send_sms(mobile, "Your Sewa Setu OTP is %s. Valid for 5 minutes." % code)
@@ -330,7 +400,7 @@ def verify():
         if row and str(row[0]).strip() == str(code).strip():
             created_at = row[1]
 
-            if (datetime.now() - created_at).total_seconds() <= OTP_VALIDITY_SECONDS:
+            if (now_ist() - created_at).total_seconds() <= OTP_VALIDITY_SECONDS:
                 session["verified_mobile"] = mobile
                 return redirect(url_for("form_step", step=1))
             else:
@@ -369,7 +439,7 @@ def upload():
         if f is None or f.filename == "":
             flash("Please choose a file to upload (JPG, PNG or PDF, up to 5 MB).")
             return render_template("upload.html")
-        filename = f.filename.lower()
+        filename = safe_upload_name(f.filename)
         content = f.read()
         if not filename.rsplit(".", 1)[-1] in ("pdf", "jpg", "jpeg", "png"):
             flash("Please upload a JPG, PNG or PDF file.")
@@ -418,8 +488,20 @@ def handle_submission():
               "apply afresh." % (existing[1], existing[2]))
         return redirect(url_for("index"))
 
-    new_id, app_no = create_application(cur, mobile, cleaned)
-    conn.commit()
+    try:
+        new_id, app_no = create_application(cur, mobile, cleaned)
+        conn.commit()
+    except pg_errors.UniqueViolation as e:
+        conn.rollback()
+        cur.close(); conn.close()
+        if e.diag.constraint_name == ACTIVE_INDEX:
+            flash("An application already exists for this mobile number. A pending "
+                  "application can be withdrawn from the status portal if you need to "
+                  "apply afresh.")
+        else:
+            flash("Your application could not be saved because of a simultaneous "
+                  "request. Please submit again.")
+        return redirect(url_for("index"))
     cur.close(); conn.close()
 
     session.pop("form_data", None)
@@ -464,6 +546,14 @@ def generate_acknowledgment(cur, app_id):
     pdf.multi_cell(0, 5, "This is a computer generated acknowledgment. Processing SLA "
                          "as per the Purvanchal Right to Public Services Act applies.")
     return bytes(pdf.output())
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    """End the sign-in on this browser (applicants use shared phones and kiosks)."""
+    session.clear()
+    flash("You have been signed out.")
+    return redirect(url_for("index"))
+
 
 @app.route("/status", methods=["GET", "POST"])
 def status_login():
@@ -520,15 +610,10 @@ def withdraw_application(app_id):
     mobile = session["portal_mobile"]
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("UPDATE applications SET status = 'WITHDRAWN', decided_at = %s, "
-                "decided_by = 'APPLICANT' WHERE id = %s AND mobile = %s "
-                "AND status = 'PENDING' RETURNING application_no",
-                (datetime.now(), app_id, mobile))
-    row = cur.fetchone()
-    if row:
-        write_audit(cur, app_id, "WITHDRAW", "applicant:%s" % mobile)
+    app_no = withdraw_pending(cur, app_id, mobile)
+    if app_no:
         conn.commit()
-        flash("Application %s has been withdrawn. You may submit a new application." % row[0])
+        flash("Application %s has been withdrawn. You may submit a new application." % app_no)
     else:
         flash("Only a pending application can be withdrawn.")
     cur.close(); conn.close()
@@ -604,7 +689,7 @@ def admin_dashboard():
     cur.execute("SELECT status, count(*) FROM applications GROUP BY status")
     by_status = cur.fetchall()
     cur.execute("SELECT count(*) FROM applications WHERE status = 'PENDING' "
-                "AND submitted_at < %s", (datetime.now() - timedelta(days=SLA_DAYS),))
+                "AND submitted_at < %s", (now_ist() - timedelta(days=SLA_DAYS),))
     overdue = cur.fetchone()[0]
     cur.execute("SELECT block, count(*) FROM applications WHERE status = 'PENDING' "
                 "GROUP BY block ORDER BY count(*) DESC")
@@ -620,7 +705,10 @@ def admin_list():
         return redirect(url_for("admin_login"))
     status = request.args.get("status", "PENDING")
     mobile = request.args.get("mobile", "").strip()
-    page = int(request.args.get("page", 1))
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+    except ValueError:
+        page = 1
     conn = get_db()
     cur = conn.cursor()
     if mobile:
@@ -631,11 +719,15 @@ def admin_list():
     else:
         cur.execute("SELECT id, application_no, applicant_name, mobile, block, status, "
                     "submitted_at FROM applications WHERE status = %s "
-                    "ORDER BY submitted_at ASC LIMIT 50 OFFSET %s",
+                    "ORDER BY submitted_at ASC LIMIT 51 OFFSET %s",
                     (status, (page - 1) * 50))
     rows = cur.fetchall()
     cur.close(); conn.close()
-    return render_template("admin_list.html", rows=rows, status=status, page=page, mobile=mobile)
+    # A 51st row only tells us there is a next page; it is not shown.
+    has_next = (not mobile) and len(rows) > 50
+    rows = rows[:50]
+    return render_template("admin_list.html", rows=rows, status=status, page=page, mobile=mobile,
+                           has_next=has_next)
 
 
 @app.route("/admin/application/<int:app_id>")
@@ -658,22 +750,23 @@ def admin_view(app_id):
     cur.close(); conn.close()
     return render_template("admin_view.html", a=row, app_id=app_id, audit=audit)
 
-
 def _admin_decide(app_id, new_status, note):
     """Approve/reject a PENDING application, recording who decided and when."""
     if not session.get("admin"):
         abort(403)
     actor = session.get("admin_user", ADMIN_USERNAME)
+    if len(note) > MAX_NOTE:
+        flash("The note is too long (at most %d characters)." % MAX_NOTE)
+        return redirect(url_for("admin_view", app_id=app_id))
+    if new_status == "REJECTED" and not note.strip():
+        flash("A reason is required to reject an application.")
+        return redirect(url_for("admin_view", app_id=app_id))
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("UPDATE applications SET status = %s, decided_at = %s, decided_by = %s "
-                "WHERE id = %s AND status = 'PENDING' RETURNING application_no",
-                (new_status, datetime.now(), actor, app_id))
-    row = cur.fetchone()
-    if row:
-        write_audit(cur, app_id, new_status, "admin:%s" % actor, note)
+    app_no = decide_pending(cur, app_id, new_status, actor, note)
+    if app_no:
         conn.commit()
-        flash("Application %s %s." % (row[0], new_status.lower()))
+        flash("Application %s %s." % (app_no, new_status.lower()))
     else:
         flash("Only a pending application can be decided.")
     cur.close(); conn.close()
@@ -693,90 +786,32 @@ def admin_reject(app_id):
 # MCP evaluation dashboard
 # ---------------------------------------------------------------------------
 
-EVAL_RESULTS = [
-    {
-        "id": "CIT-001",
-        "persona": "Nitika Agarwal",
-        "age": 66,
-        "village": "raigarh",
-        "goal": "Check eligibility and submit pension application",
-        "channel": "Citizen MCP",
-        "expected": "Eligible application can be created",
-        "actual": "Application created in portal database",
-        "status": "PASS",
-    },
-    {
-        "id": "CIT-002",
-        "persona": "Kamla Devi",
-        "age": 55,
-        "village": "Sonari",
-        "goal": "Apply for old age pension",
-        "channel": "Citizen MCP",
-        "expected": "Application must be rejected because age is below 60",
-        "actual": "Eligibility rejected",
-        "status": "PASS",
-    },
-    {
-        "id": "CIT-003",
-        "persona": "Ramesh Das",
-        "age": 70,
-        "village": "Borgaon",
-        "goal": "Check existing application status",
-        "channel": "Citizen MCP",
-        "expected": "Only own application is visible",
-        "actual": "Citizen-scoped application lookup",
-        "status": "PASS",
-    },
-    {
-        "id": "OFF-001",
-        "persona": "Block Officer",
-        "age": "-",
-        "village": "Borgaon",
-        "goal": "Review pending applications",
-        "channel": "Officer MCP",
-        "expected": "Officer can list applications",
-        "actual": "Pending application queue available",
-        "status": "PASS",
-    },
-    {
-        "id": "SEC-001",
-        "persona": "Citizen token",
-        "age": "-",
-        "village": "-",
-        "goal": "Attempt to access officer tools",
-        "channel": "Security",
-        "expected": "Officer tools must not be exposed",
-        "actual": "Citizen endpoint exposes only citizen tools",
-        "status": "PASS",
-    },
-    {
-        "id": "SEC-002",
-        "persona": "Officer token",
-        "age": "-",
-        "village": "-",
-        "goal": "Access officer MCP",
-        "channel": "Security",
-        "expected": "Officer tools available only on officer endpoint",
-        "actual": "Officer endpoint exposes officer tools",
-        "status": "PASS",
-    },
-]
+EVAL_RESULTS_PATH = os.environ.get("EVAL_RESULTS_PATH",
+                                   os.path.join(BASE_DIR, "eval_results.json"))
+
+
+def load_eval_results():
+    """Results of real eval runs, written by the eval harness as a JSON list of dicts
+    (id, persona, age, village, goal, channel, expected, actual, status).
+    Empty until a run has happened."""
+    try:
+        with open(EVAL_RESULTS_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
 
 
 @app.route("/eval-dashboard")
 def eval_dashboard():
-    passed = sum(1 for x in EVAL_RESULTS if x["status"] == "PASS")
-    total = len(EVAL_RESULTS)
+    results = load_eval_results()
+    passed = sum(1 for x in results if x.get("status") == "PASS")
+    total = len(results)
     percentage = round((passed / total) * 100, 1) if total else 0
+    return render_template("eval_dashboard.html", results=results,
+                           passed=passed, total=total, percentage=percentage)
 
-    return render_template(
-        "eval_dashboard.html",
-        results=EVAL_RESULTS,
-        passed=passed,
-        total=total,
-        percentage=percentage,
-    )
-    
+
 from oauth import oauth as _oauth_blueprint   # noqa: E402  (needs the definitions above)
 app.register_blueprint(_oauth_blueprint)
 
